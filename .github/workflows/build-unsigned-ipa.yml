@@ -15,15 +15,19 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-15 预装 Xcode 26（支持 objectVersion 77 的新工程格式，XcodeGen 2.46 默认输出该格式）
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: 拉取代码
         uses: actions/checkout@v4
 
-      - name: 确认 Xcode
+      - name: 选择最新 Xcode
         run: |
-          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          ls -d /Applications/Xcode*.app
+          LATEST=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          echo "使用 $LATEST"
+          sudo xcode-select -s "$LATEST"
           xcodebuild -version
 
       - name: 安装 xcodegen
