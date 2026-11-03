@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width,initial-scale=1.0">
+		<title>Document</title>
+		<link rel="stylesheet" href="./leaflet/leaflet.css">
+		<script type="text/javascript" src="./leaflet/leaflet.js"></script>
+		<script type="text/javascript" src="./config.js"></script>
+		<style>
+			html,
+			body,
+			#map {
+				height: 100%;
+				width: 100%;
+				margin: 0;
+				padding: 0;
+			}
+		</style>
+	</head>
+	<body>
+		<div id="map"></div>
+
+		<script>
+			//底图瓦片服务实测只有 z1~z5 层级（z0 与 z6 及以上均 404，2026-10-26 实测）
+			let maxNativeZoom = 5;   //底图真实最大层级
+			let minNativeZoom = 1;   //底图真实最小层级
+			let map = L.map('map', {
+				minZoom: 2,          //可缩小到约半个东半球（能看到中国全境），z0 缺失故不设 1
+				maxZoom: 12,
+				center: [32.550339, 106.114129],
+				zoom: 4,
+				attributionControl: false,
+				zoomSnap: 0.5,
+				zoomDelta: 0.5
+			});
+			//底图：优先 config.js 的 mapLayers（多图层，如天地图影像+注记），否则退回单图层 mapApi
+			if (typeof mapLayers != 'undefined' && mapLayers && mapLayers.length) {
+				let mz = 12;
+				mapLayers.forEach(function(l){
+					L.tileLayer(l.url, {
+						subdomains: l.subdomains || 'abc',
+						minNativeZoom: l.minNativeZoom != null ? l.minNativeZoom : minNativeZoom,
+						maxNativeZoom: l.maxNativeZoom != null ? l.maxNativeZoom : maxNativeZoom
+					}).addTo(map);
+					if (l.maxNativeZoom != null) mz = Math.max(mz, l.maxNativeZoom);
+				});
+				map.setMaxZoom(Math.min(mz, 18)); //高清底图（如天地图）放开放大层级
+			} else {
+				let url = mapApi; //使用 config.js 中配置的底图地址
+				// let url = "http://192.168.1.207:8011/apimap/{z}/{x}/{y}.png"; //公司底图
+				// let url = "https://map.geoq.cn/ArcGIS/rest/services/ChinaOnlineCommunity/MapServer/tile/{z}/{y}/{x}";
+				// maxNativeZoom：超出底图真实层级的放大用 z5 原图拉伸，避免一片灰白
+				// maxNativeZoom 之外的缩小同样用 z1 拉伸，避免 z0 缺失导致灰块
+				L.tileLayer(url, {
+					minNativeZoom: minNativeZoom,
+					maxNativeZoom: maxNativeZoom
+				}).addTo(map);
+			}
+
+			let marker = null;
+			let targetType = null;
+			let targetData = [];
+			let stripeList = [];
+			let pendingFit = null;   //需要在图层绘制完成后执行的视野适配
+			let hasFitOnce = false;  //是否已做过自动适配（同一页面只自动适配一次，之后保留用户手动缩放的视野）
+			//===== 加点模式（新建需求 - 区域/矩形/多边形目标，地图真实点击加点） =====
+			let drawMode = false;        //是否处于加点模式
+			let drawType = null;         //'rectangle' | 'polygon'
+			let drawPoints = [];         //已点的经纬度 [lng,lat] 顺序
+			let drawMarker = null;       //起点标记
+			let drawVertexMarkers = [];  //每个顶点的小圆点标记
+			let drawShape = null;        //当前预览的矩形/多边形图层
+
+			//初始化时即有数据（页面 created 阶段就把消息 post 过来），layers 会早于 tiles 加入地图，
+			//Leaflet 的 SVG 渲染器可能在其他 pane 就绪前完成定位，导致 path 停在 "M0 0"。
+			//补一次静默重定位彻底规避该问题。
+			function settleVectors() {
+				setTimeout(function() {
+					[].concat(stripeList, targetData).forEach(function(layer) {
+						if(layer && typeof layer.redraw === 'function') layer.redraw()
+					})
+				}, 0)
+			}
+
+			map.on('click', handlerMapClick)
+
+			//vue向html传值
+			window.addEventListener('message', e => {
+				let {
+					type,
+					data
+				} = e.data;
+				targetType = type;
+				switch (type) {
+					case 'showPoint':
+						// marker = L.marker(data).addTo(map);
+						addPoint(data)
+						break;
+					case 'addPolygon':
+						marker = L.polygon(data).addTo(map);
+						// map.fitBounds(data);
+						// map.flyTo([data[0][0],data[0][1]],5)
+						break;
+					case 'addRectangle':
+						marker = L.rectangle(data, {color: "#fff045", weight: 1}).addTo(map);
+						// map.fitBounds(data);
+						// map.flyTo([data[0][0],data[0][1]],5)
+						break;
+					case 'showStripe':
+						showStripeData(data)
+						break;
+					case 'showTarget':
+						showTargetList(data)
+						break;
+					case 'showTargetAndStripe':
+						//先重置待适配点，绘制完成后统一 fitBounds（把所有条带与目标装进视野）
+						pendingFit = []
+						if(data.target&&data.target.length){
+							showTargetList(data.target)
+							collectFitPoints(data.target)
+						}
+						if(data.stripe&&data.stripe.length){
+							showStripeData(data.stripe)
+							collectFitPoints(data.stripe)
+						}
+						fitToPending();
+						break;
+					case 'fitToData':
+						//外部显式要求适配视野：data 可为条带/目标数组，也可为 {target:[],stripe:[]}
+						pendingFit = []
+						collectFitPoints(data)
+						fitToPending();
+						break;
+					case 'currentSelectById':
+						currentSelectObj(data)
+						break;
+					//===== 加点模式消息 =====
+					case 'startDraw':
+						//data: 'rectangle' | 'polygon'；进入加点模式并清空已有绘制
+						startDraw(data);
+						break;
+					case 'stopDraw':
+						//退出加点模式（不清理已画图形，保留预览）
+						drawMode = false;
+						break;
+					case 'syncDrawPoints':
+						//Vue 侧坐标列表变化（编辑/删除）后同步到地图重绘
+						syncDrawPoints(data);
+						break;
+					case 'clearDraw':
+						//清空绘制并退出加点模式
+						clearDraw(true);
+						break;
+					default:
+						break;
+				}
+			})
+
+			//收集待适配视野的经纬度点（leaflet 用 [lat,lng]）
+			//兼容两种入参：数组 [{pointList:[[lng,lat],...]}] 或 {target:[],stripe:[]}
+			function collectFitPoints(data) {
+				if(!data) return
+				let groups = []
+				if(Array.isArray(data)){
+					groups.push(data)
+				}else{
+					if(data.target&&data.target.length) groups.push(data.target)
+					if(data.stripe&&data.stripe.length) groups.push(data.stripe)
+				}
+				groups.forEach(group=>{
+					group.forEach(item=>{
+						let pts = item.pointList
+						if(!pts) return
+						//point 类型是单个 [lat,lng]，polygon 类型是 [[lng,lat],...]
+						if(typeof pts[0] === 'number'){
+							pushFitPoint(pts[0], pts[1])
+						}else{
+							pts.forEach(p=>{
+								if(p&&p.length>=2) pushFitPoint(p[1], p[0])
+							})
+						}
+					})
+				})
+			}
+			//防御：坐标不合法（NaN / 超范围）时不参与 fitBounds，避免地图被 setView 到北极点
+			function pushFitPoint(lat, lng) {
+				lat = Number(lat); lng = Number(lng)
+				if(!isFinite(lat) || !isFinite(lng)) return
+				if(lat < -85 || lat > 85 || lng < -180 || lng > 180) return
+				pendingFit.push([lat, lng])
+			}
+			//按待适配点计算视野并 fitBounds
+			function fitToPending() {
+				if(!pendingFit||!pendingFit.length) return
+				//只自动适配一次，避免用户手动缩放后被重置；后续数据刷新只重绘图层
+				if(hasFitOnce){
+					pendingFit = null
+					return
+				}
+				let bounds = L.latLngBounds(pendingFit)
+				pendingFit = null
+				if(!bounds.isValid()) return
+				//防御：范围超出合法纬度时放弃自动适配，避免飞到极点
+				if(bounds.getNorth() > 85 || bounds.getSouth() < -85) return
+				//fitBounds 内部按 LatLng 对象处理，不应对 bounds 再做 [lat,lng] → [lng,lat] 反转
+				//（实测反转后会 setView 到北极点 lat=85.05）
+				//animate:false 避开 zoom 动画期间 SVG 图层 path 停在 "M0 0" 的问题
+				map.fitBounds(bounds, { padding: [24,24], maxZoom: 9, animate: false })
+				hasFitOnce = true
+				settleVectors()
+			}
+
+			//兜底：每次缩放/移动结束后重算一次矢量图层，规避 path 停在 "M0 0"
+			map.on('zoomend moveend', settleVectors)
+
+			function addPoint(lnglat = [110.60073, 27.574273]) {
+				if(Array.isArray(lnglat)){
+					marker = L.marker({lat:lnglat[1],lng:lnglat[0]}).addTo(map)
+				}else if(lnglat.position&&Array.isArray(lnglat.position)){
+					marker = L.marker({lat:lnglat.position[1],lng:lnglat.position[0]}).addTo(map)
+				} else{
+					marker = L.marker(lnglat).addTo(map)
+				}
+
+				// map.flyTo([lnglat[1],lnglat[0]],5)
+
+				// marker.bindPopup("<b>Hello world!</b><br>I am a popup.").openPopup();
+			}
+			function showStripeData (data) {
+				if(stripeList&&stripeList.length){
+					for(let i=0;i<stripeList.length;i++){
+						map.removeLayer(stripeList[i])
+					}
+					stripeList = [];
+				}
+				if(data&&data.length){
+					for(let i=0;i<data.length;i++){
+						let obj = L.polygon(data[i].pointList,{color: "#fff045", weight: 1,layerId:data[i].id}).addTo(map);
+						stripeList.push(obj);
+					}
+				}
+				// map._layers[56].setStyle({color:"#1bff51"})
+			}
+			function showTargetList (data) {
+				if(targetData&&targetData.length){
+					for(let i=0;i<targetData.length;i++){
+						map.removeLayer(targetData[i])
+					}
+					targetData = [];
+				}
+				if(data&&data.length){
+					for(let i=0;i<data.length;i++){
+						if(data[i].type.toUpperCase() == 'POINT'){
+						 let obj = L.marker(data[i].pointList,{color: "#1065ff", weight: 1,layerId:data[i].id}).addTo(map)
+							targetData.push(obj)
+						}else {
+							if(data[i].pointList.length == 2){
+								let obj = L.rectangle(data[i].pointList,{color: "#1065ff", weight: 1,layerId:data[i].id}).addTo(map);
+								targetData.push(obj);
+							}else{
+								let obj = L.polygon(data[i].pointList,{color: "#1065ff", weight: 1,layerId:data[i].id}).addTo(map);
+								targetData.push(obj);
+							}
+						}
+					}
+				}
+			}
+			function currentSelectObj (Id) {
+				Object.keys(map._layers).forEach(key=>{
+					if(map._layers[key].options&&map._layers[key].options.layerId){
+						if(map._layers[key].options.layerId == Id){
+							map._layers[key].setStyle({color:"#0fff0a",weight: 3})
+						}else{
+							map._layers[key].setStyle({color:"#fff045",weight: 1})
+						}
+						// console.log(map._layers[key].options.layerId)
+					}
+				})
+			}
+
+			//点击地图事件
+			function handlerMapClick(e) {
+				//加点模式：点击即真实加点
+				if(drawMode){
+					handleDrawClick(e.latlng)
+					return
+				}
+				if(targetType == 'addPolygon') {
+					return
+				}
+				if(localStorage.getItem('mapCanClick') != 0) {
+					return
+				}
+				map.flyTo(e.latlng);
+				var popup = L.popup(); // 弹出层
+				map.removeLayer(marker)
+				addPoint(e.latlng)
+				toVue('changePoint', [e.latlng.lat.toFixed(4), e.latlng.lng.toFixed(4)]);
+			}
+
+			//===== 加点模式实现 =====
+			//进入加点模式：drawType 为 'rectangle' 或 'polygon'
+			function startDraw(type) {
+				clearDraw(false)
+				drawMode = true
+				drawType = (type == 'rectangle') ? 'rectangle' : 'polygon'
+				drawPoints = []
+				targetType = null   //解除 addPolygon 时的点击阻断
+			}
+			//退出加点模式（keepShape: 是否同时清掉已画的图形与顶点）
+			function clearDraw(keepShape) {
+				drawMode = false
+				drawType = null
+				drawPoints = []
+				if(drawMarker){ map.removeLayer(drawMarker); drawMarker = null }
+				drawVertexMarkers.forEach(m=>map.removeLayer(m))
+				drawVertexMarkers = []
+				if(keepShape !== false){
+					if(drawShape){ map.removeLayer(drawShape); drawShape = null }
+				}
+			}
+			//加点模式下点击地图
+			function handleDrawClick(latlng) {
+				let lng = Number(latlng.lng.toFixed(6))
+				let lat = Number(latlng.lat.toFixed(6))
+				//矩形最多两个点（对角线）
+				if(drawType == 'rectangle' && drawPoints.length >= 2){
+					toVue('drawToast', ['矩形目标只需要 2 个点（对角线），可在下方列表编辑坐标'])
+					return
+				}
+				drawPoints.push([lng, lat])
+				//起点放一个醒目标记，其余顶点放小圆点
+				let isStart = drawPoints.length == 1
+				let m = L.circleMarker([lat, lng], {
+					radius: isStart ? 7 : 5,
+					color: '#ffffff',
+					weight: 2,
+					fillColor: isStart ? '#1065ff' : '#ff9800',
+					fillOpacity: 1
+				}).addTo(map)
+				if(isStart){ drawMarker = m } else { drawVertexMarkers.push(m) }
+				redrawShape()
+				//回传给 Vue：[[lng,lat],...]
+				toVue('drawPoint', JSON.parse(JSON.stringify(drawPoints)))
+			}
+			//根据 drawPoints 重绘预览形状
+			function redrawShape() {
+				if(drawShape){ map.removeLayer(drawShape); drawShape = null }
+				if(drawPoints.length == 1) return
+				let pts = drawPoints.map(p=>[p[1], p[0]])   //leaf 用 [lat,lng]
+				if(drawType == 'rectangle'){
+					if(drawPoints.length == 2){
+						drawShape = L.rectangle(pts, {color:'#1065ff', weight:2, dashArray:'6 4', fillOpacity:0.15}).addTo(map)
+					}
+				}else{
+					if(drawPoints.length >= 2){
+						drawShape = L.polygon(pts, {color:'#1065ff', weight:2, dashArray:'6 4', fillOpacity:0.15}).addTo(map)
+					}
+				}
+			}
+			//Vue 侧坐标列表变更后同步重绘（data: [[lng,lat],...]）
+			function syncDrawPoints(data) {
+				if(!drawMode) return
+				drawPoints = (data||[]).map(p=>[Number(p[0]), Number(p[1])]).filter(p=>isFinite(p[0])&&isFinite(p[1]))
+				//重建顶点标记
+				drawVertexMarkers.forEach(m=>map.removeLayer(m))
+				drawVertexMarkers = []
+				if(drawMarker){ map.removeLayer(drawMarker); drawMarker = null }
+				drawPoints.forEach((p, i)=>{
+					let isStart = i == 0
+					let m = L.circleMarker([p[1], p[0]], {
+						radius: isStart ? 7 : 5,
+						color: '#ffffff',
+						weight: 2,
+						fillColor: isStart ? '#1065ff' : '#ff9800',
+						fillOpacity: 1
+					}).addTo(map)
+					if(isStart){ drawMarker = m } else { drawVertexMarkers.push(m) }
+				})
+				redrawShape()
+			}
+
+			function toVue(type, data) {
+				//html向vue传值
+				window.parent.postMessage({
+					type,
+					data
+				}, '*')
+			}
+		</script>
+	</body>
+</html>

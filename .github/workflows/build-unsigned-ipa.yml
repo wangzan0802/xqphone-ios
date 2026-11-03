@@ -1,0 +1,71 @@
+name: build-unsigned-ipa
+
+# 在 GitHub 免费的 macOS runner 上编译 iOS 壳工程，产出未签名 ipa。
+# 未签名 ipa 由 Windows 上的 Sideloadly 用免费 Apple ID 重新签名后安装到 iPhone。
+on:
+  workflow_dispatch:        # 允许手动点击运行
+  push:
+    branches: [main]
+    paths:
+      - "Sources/**"
+      - "Resources/**"
+      - "www/**"
+      - "project.yml"
+      - ".github/workflows/build-unsigned-ipa.yml"
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 确认 Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+
+      - name: 安装 xcodegen
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        run: |
+          test -f www/index.html || { echo "缺少 www/index.html"; exit 1; }
+          xcodegen generate
+          ls -la
+
+      - name: 编译（关闭签名）
+        run: |
+          xcodebuild \
+            -project XQPhone.xcodeproj \
+            -scheme XQPhone \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 组装未签名 ipa
+        run: |
+          APP_PATH="build/Build/Products/Release-iphoneos/XQPhone.app"
+          test -d "$APP_PATH" || { echo "未找到 $APP_PATH"; exit 1; }
+          file "$APP_PATH/XQPhone"
+          ls -la "$APP_PATH" | head -20
+          rm -rf out && mkdir -p out/Payload
+          cp -R "$APP_PATH" out/Payload/
+          # ad-hoc 签名：让包结构合法，Sideloadly 会在此基础上重签
+          codesign --force --deep --sign - out/Payload/XQPhone.app || true
+          ( cd out && zip -qry ../XQPhone-unsigned.ipa Payload )
+          ls -lh XQPhone-unsigned.ipa
+          unzip -l XQPhone-unsigned.ipa | head -15
+
+      - name: 上传 ipa 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: XQPhone-unsigned-ipa
+          path: XQPhone-unsigned.ipa
+          retention-days: 30
